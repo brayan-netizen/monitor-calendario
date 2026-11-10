@@ -1,0 +1,83 @@
+name: Monitor calendario 1473
+
+# Checks every 5 minutes whether SKU 1473 can be shipped to Medellín (05001)
+# in the real VTEX cart, and sends a push to the phone via ntfy when it can.
+# Disables itself after notifying (shipping found or out of stock).
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+    inputs:
+      test:
+        description: 'Solo enviar notificación de prueba al celular'
+        type: boolean
+        default: false
+
+permissions:
+  actions: write
+
+concurrency:
+  group: monitor-calendario
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Revisar envío a Medellín
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          GH_TOKEN: ${{ github.token }}
+          TEST: ${{ inputs.test }}
+        run: |
+          B=https://b2ctrendy.myvtex.com
+          SKU=1473
+          CART="$B/checkout/cart/add/?sku=$SKU&qty=1&seller=1&sc=1"
+
+          push() {
+            curl -s -m 15 -H "Title: $1" -H "Priority: urgent" -H "Tags: rotating_light" \
+              -H "Click: $CART" -d "$2" "https://ntfy.sh/$NTFY_TOPIC" >/dev/null || true
+          }
+          stop_workflow() {
+            gh workflow disable monitor-calendario.yml -R "$GITHUB_REPOSITORY" || true
+          }
+
+          if [ -z "$NTFY_TOPIC" ]; then echo "Falta el secret NTFY_TOPIC"; exit 1; fi
+
+          if [ "$TEST" = "true" ]; then
+            push "Prueba monitor calendario" "Si ves esto, GitHub Actions funciona."
+            echo "Notificación de prueba enviada"
+            exit 0
+          fi
+
+          JAR=$(mktemp)
+          OF=$(curl -s -m 20 -c "$JAR" -b "$JAR" "$B/api/checkout/pub/orderForm?sc=1" \
+            | python3 -c "import json,sys;print(json.load(sys.stdin)['orderFormId'])" 2>/dev/null || true)
+          if [ -z "$OF" ]; then echo "No se pudo crear orderForm, se reintenta en la próxima corrida"; exit 0; fi
+
+          curl -s -m 20 -c "$JAR" -b "$JAR" -X POST "$B/api/checkout/pub/orderForm/$OF/items?sc=1" \
+            -H 'Content-Type: application/json' \
+            -d "{\"orderItems\":[{\"id\":\"$SKU\",\"quantity\":1,\"seller\":\"1\"}]}" >/dev/null || true
+
+          R=$(curl -s -m 20 -c "$JAR" -b "$JAR" -X POST "$B/api/checkout/pub/orderForm/$OF/attachments/shippingData" \
+            -H 'Content-Type: application/json' \
+            -d '{"address":{"postalCode":"05001","country":"COL","addressType":"residential","state":"Antioquia","city":"Medellín","street":"Calle 1","number":"1"},"clearAddressIfPostalCodeNotFound":false}' \
+            | python3 -c "
+          import json,sys
+          d=json.load(sys.stdin)
+          it=d['items'][0] if d.get('items') else {}
+          slas=[s['id'] for li in d['shippingData']['logisticsInfo'] for s in li['slas']]
+          print(it.get('availability','noitem'), '|'.join(slas))" 2>/dev/null || echo "error ")
+
+          STATUS=${R%% *}; SLAS=${R#* }
+          echo "$(date -u '+%Y-%m-%d %H:%M:%SZ') $STATUS ${SLAS:-sin-envio}"
+
+          if [ "$STATUS" = "available" ] && [ -n "$SLAS" ]; then
+            push "Calendario disponible para Medellín" "Envío: $SLAS. Toca para comprar."
+            stop_workflow
+          elif [ "$STATUS" = "withoutStock" ]; then
+            push "Calendario agotado" "SKU $SKU sin stock."
+            stop_workflow
+          fi
